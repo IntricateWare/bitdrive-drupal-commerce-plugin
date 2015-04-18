@@ -1,0 +1,372 @@
+<?php
+    
+/*
+ * Copyright (c) 2015 IntricateWare Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_bitdrive_menu() {
+    $items = array();    
+        
+    // Define an always accessible path to receive IPN messages.
+    $items['commerce_bitdrive/ipn'] = array(
+        'page callback' => 'commerce_bitdrive_process_ipn',
+        'page arguments' => array(),
+        'access callback' => true,
+        'type' => MENU_CALLBACK
+    );
+    
+    return $items;
+}
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function commerce_bitdrive_commerce_payment_method_info() {
+    $payment_methods = array();
+    
+    $payment_methods['bitdrive_standard'] = array(
+        'base' => 'commerce_bitdrive_standard',
+        'title' => t('BitDrive Standard Checkout'),
+        'short_title' => t('BitDrive'),
+        'description' => t('Accept bitcoin using BitDrive Standard Checkout'),
+        'terminal' => false,
+        'offsite' => true,
+        'offsite_autoredirect' => true
+    );
+    
+    return $payment_methods;
+}
+
+/**
+ * Payment method callback to build the payment redirect form.
+ *
+ * @param array $form
+ * @param mixed $form_state
+ * @param array $order
+ * @param array $payment_method
+ * 
+ * @return array
+ */
+function commerce_bitdrive_standard_redirect_form($form, &$form_state, $order, $payment_method) {
+    $wrapper = entity_metadata_wrapper('commerce_order', $order);
+    $settings = $payment_method['settings'];
+    
+    $data = array(
+        'bd-cmd'            => 'pay',
+        'bd-merchant'       => $settings['merchant_id'],
+        'bd-currency'       => $wrapper->commerce_order_total->currency_code->value(),
+        'bd-amount'         => ($wrapper->commerce_order_total->amount->value() / 100),
+        'bd-memo'           => commerce_bitdrive_build_transaction_memo($order),
+        'bd-invoice'        => $order->order_id,
+        'bd-success-url'    => url('checkout/' . $order->order_id . '/payment/return/' .
+                                   $order->data['payment_redirect_key'], array('absolute' => true)),
+        'bd-error-url'      => url('checkout/' . $order->order_id . '/payment/back/' .
+                                   $order->data['payment_redirect_key'], array('absolute' => true))
+    );
+    
+    
+    $form = array(
+        '#action' => 'https://www.bitdrive.io/pay',
+        
+        '#submit' => array(
+            '#type' => 'submit',
+            '#value' => t('Proceed to BitDrive')
+        )
+    );
+    
+    foreach ($data as $name => $value) {
+        if (strlen(trim($value)) > 0) {
+            $form[$name] = array('#type' => 'hidden', '#value' => $value);
+        }
+    }
+    
+    return $form;
+}
+
+/**
+ * Build the transaction memo based on the commerce_order parameter.
+ *
+ * @param array $order
+ *
+ * @return string
+ */
+function commerce_bitdrive_build_transaction_memo(&$order) {
+    $memo = sprintf('Payment for Order #' . $order->order_id);
+    if (count($order->commerce_line_items['und']) <= 2) {
+        $item = commerce_product_load($order->commerce_line_items['und'][0]['line_item_id']);
+        $name = $item->title;
+        $sku = $item->sku;
+        $itemString = sprintf('%s%s', $name, (strlen(trim($sku)) > 0) ? ' [SKU: ' . $sku . ']': '');
+    
+        $newMemo = sprintf('%s: %s', $memo, $itemString);
+        if (strlen($newMemo) <= 200) {
+            $memo = $newMemo;
+        }
+    }
+    
+    return $memo;
+}
+
+/**
+ * Payment method callback to build the settings form.
+ *
+ * @return array
+ */
+function commerce_bitdrive_standard_settings_form($settings = array()) {
+    return array(
+        'merchant_id' => array(
+            '#type' => 'textfield',
+            '#title' => t('Merchant ID'),
+            '#description' => t('Your BitDrive merchant ID'),
+            '#required' => true,
+            '#default_value' => isset($settings['merchant_id']) ? $settings['merchant_id'] : ''
+        ),
+        'ipn_secret' => array(
+            '#type' => 'textfield',
+            '#title' => t('IPN Secret'),
+            '#description' => t('Thw IPN secret configured in your BitDrive Merchant Account Settings'),
+            '#required' => false,
+            '#default_value' => isset($settings['ipn_secret']) ? $settings['ipn_secret'] : ''
+        ),
+        'ipn_debug' => array(
+            '#type' => 'radios',
+            '#title' => t('IPN Debug Mode'),
+            '#options' => array(
+                'on' => t('Enabled'),
+                'off' => t('Disabled')
+            ),
+            '#default_value' => isset($settings['ipn_debug']) ? $settings['ipn_debug'] : 'off'
+        ),
+        'completed_order_status' => array(
+            '#type' => 'select',
+            '#title' => t('Payment Complete Status'),
+            '#options' => array(
+                'completed' => t('Completed'),
+                'processing' => t('Processing')
+            ),
+            '#default_value' => isset($settings['completed_order_status']) ?
+                $settings['completed_order_status'] : 'completed'
+        )
+    );
+}
+
+/**
+ * Process BitDrive IPN messages
+ */
+function commerce_bitdrive_process_ipn() {
+    // Only process HTTP POST requests
+    if ($_SERVER['REQUEST_METHOD'] != 'POST') {
+        exit;   
+    }
+    
+    // Check for SHA 256 support
+    if (!in_array('sha256', hash_algos())) {
+        watchdog('commerce_bitdrive',
+                 'The PHP installation does not support the SHA 256 hash algorithm.',
+                 array(),
+                 WATCHDOG_ERROR);
+        exit;
+    }
+    
+    // Check the IPN data
+    $data = file_get_contents('php://input');
+    $json = json_decode($data);
+    if (!$json) {
+        watchdog('commerce_bitdrive',
+                 'The BitDrive IPN JSON data is invalid.',
+                 array(),
+                 WATCHDOG_ERROR);
+        exit;
+    }
+    
+    // Check for the IPN parameters that are required
+    $requiredIpnParams = array(
+        'notification_type',
+        'sale_id',
+        'merchant_invoice',
+        'amount',
+        'bitcoin_amount'
+    );
+    foreach ($requiredIpnParams as $param) {
+        if (!isset($json->$param) || strlen(trim($json->$param)) == 0) {
+            watchdog('commerce_bitdrive',
+                     sprintf('Missing %s IPN parameter.', $param),
+                     array(),
+                     WATCHDOG_ERROR);
+            exit;
+        }
+    }
+    
+    // Checkt the order in the system
+    $order_id = $json->merchant_invoice;
+    $order = commerce_order_load($order_id);
+    if (!$order || !isset($order->data['payment_method'])) {
+        watchdog('commerce_bitdrive',
+                 'The notification message contains an invalid order.',
+                 array(),
+                 WATCHDOG_ERROR);
+        exit;
+    }
+    
+    
+    // Explode the payment method key into its component parts and verify
+    $instance_id = $order->data['payment_method'];
+    list($method_id, $rule_name) = explode('|', $instance_id);
+    if (empty($method_id) || empty($rule_name)) {
+        watchdog('commerce_bitdrive',
+                 'The order contains an invalid payment method key.',
+                 array(),
+                 WATCHDOG_ERROR);
+        exit;
+    }
+    
+    $payment_method = commerce_payment_method_load($method_id);
+    if (!$payment_method) {
+        watchdog('commerce_bitdrive',
+                 'The payment method is invalid for the order.',
+                 array(),
+                 WATCHDOG_ERROR);
+        exit;
+    }
+
+    // Load the rule configuration that enables the payment method
+    $rule = rules_config_load($rule_name);
+    if (!$rule) {
+        watchdog('commerce_bitdrive',
+                 'The payment method rule is invalid for the order.',
+                 array(),
+                 WATCHDOG_ERROR);
+        exit;
+    }
+
+    // Load the payment method settings
+    $payment_method['instance_id'] = $instance_id;
+    $payment_method['settings'] = array();
+    foreach ($rule->actions() as $action) {
+        if ($action->getElementName() == 'commerce_payment_enable_' . $method_id) {
+            if (is_array($action->settings['payment_method'])
+                && !empty($action->settings['payment_method']['settings'])) {
+                $payment_method['settings'] = $action->settings['payment_method']['settings'];
+            }
+        }
+    }
+    if (empty($payment_method['settings'])) {
+        watchdog('commerce_bitdrive',
+                 'The payment method settings could not be loaded.',
+                 array(),
+                 WATCHDOG_ERROR);
+        exit;
+    }
+    
+    // Verify the SHA 256 hash
+    $merchant_id = $payment_method['settings']['merchant_id'];
+    $ipn_secret = $payment_method['settings']['ipn_secret'];
+    $ipn_debug = ($payment_method['settings']['ipn_debug'] == 'on');
+    $hash_string = strtoupper(hash('sha256', $json->sale_id . $merchant_id . $json->merchant_invoice . $ipn_secret));
+    if ($hash_string != $json->hash) {
+        watchdog('commerce_bitdrive',
+                 'The notification message cannot be processed due to a hash mismatch.',
+                 array(),
+                 WATCHDOG_ERROR);
+        exit;
+    }
+    
+    if ($ipn_debug) {
+        watchdog('commerce_bitdrive',
+                 sprintf('Received %s IPN message: %s', $json->notification_type, $data),
+                 array(),
+                 WATCHDOG_NOTICE);
+    }
+    
+    // Build a transaction based on the message
+    $transaction = null;
+    if ($json->notification_type == 'ORDER_CREATED') {
+        // Create a new transaction for ORDER_CREATED
+        $transaction = commerce_payment_transaction_new('bitdrive_standard', $order->order_id);
+        $transaction->instance_id = $payment_method['instance_id'];
+    } else {
+        // Load the existing transaction for other notification types
+        $transactions = commerce_payment_transaction_load_multiple(array(), array('remote_id' => $json->sale_id));
+        if ($transactions) {
+            $transaction = reset($transactions);
+        }
+    }
+    
+    if (!$transaction) {
+        watchdog('commerce_bitdrive',
+                 sprintf('The transaction object for order ID %s could not be initialised.', $order_id),
+                 array(),
+                 WATCHDOG_ERROR);
+        exit;
+    }
+    
+    // Update the transaction fields based on the notification type
+    $order_status = null;
+    $transaction->message = $json->notification_description;
+    switch ($json->notification_type) {
+        // Order created
+        case 'ORDER_CREATED':
+            $transaction->remote_id = $json->sale_id;
+            $transaction->amount = commerce_currency_decimal_to_amount($json->amount, $json->currency);
+            $transaction->currency_code = $json->currency;
+            $transaction->remote_status = 'Created';
+            $transaction->status = COMMERCE_PAYMENT_STATUS_PENDING;
+            
+            break;
+        
+        // Payment completed
+        case 'PAYMENT_COMPLETED':
+            $transaction->remote_status = 'Completed';
+            $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+            $order_status = $payment_method['settings']['completed_order_status'];
+            break;
+        
+        // Transaction cancelled/expired
+        case 'TRANSACTION_CANCELLED':
+            $transaction->remote_status = 'Cancelled';
+            $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+            $order_status = 'pending';
+            break;
+            
+        case 'TRANSACTION_EXPIRED':
+            $transaction->remote_status = 'Expired';
+            $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+            $order_status = 'pending';
+            break;
+    }
+    
+    // Save the transaction information
+    commerce_payment_transaction_save($transaction);    
+    
+    // Update the order status
+    if ($json->notification_type != 'ORDER_CREATED' && $order_status != null) {
+        commerce_order_status_update($order, $order_status);
+    }
+    watchdog('commerce_bitdrive',
+             sprintf('IPN successfully processed for order ID %s.', $order_id),
+             array(),
+             WATCHDOG_INFO);
+}
+
+?>
